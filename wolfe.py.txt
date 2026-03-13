@@ -1,0 +1,708 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from scipy.signal import argrelextrema
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# إعداد الصفحة
+# ============================================================
+st.set_page_config(
+    page_title="Wolfe Wave Scanner - السوق السعودي",
+    page_icon="🐺",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        color: #1E88E5;
+        font-size: 2.5rem;
+        font-weight: bold;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        text-align: center;
+        color: #666;
+        font-size: 1.2rem;
+        margin-bottom: 2rem;
+    }
+    .result-card {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        border-radius: 15px;
+        padding: 20px;
+        margin: 10px 0;
+        border: 1px solid #0f3460;
+    }
+    .stApp {
+        direction: rtl;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-header">🐺 ماسح موجة الولف ويف الصاعدة</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">تحليل السوق السعودي - Bullish Wolfe Wave Scanner</div>', unsafe_allow_html=True)
+
+# ============================================================
+# قائمة الأسهم السعودية
+# ============================================================
+SAUDI_STOCKS = {
+    "2222.SR": "أرامكو السعودية",
+    "1120.SR": "الراجحي",
+    "2010.SR": "سابك",
+}
+
+# ============================================================
+# دوال مساعدة
+# ============================================================
+
+def download_data(symbol, period, interval):
+    """تحميل بيانات السهم"""
+    try:
+        if interval == "1wk":
+            if period == "1y":
+                period = "2y"
+            elif period == "6mo":
+                period = "1y"
+
+        data = yf.download(symbol, period=period, interval=interval, progress=False)
+        if data is not None and len(data) > 0:
+            data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
+            data = data.reset_index()
+            return data
+    except Exception as e:
+        st.warning(f"خطأ في تحميل {symbol}: {e}")
+    return None
+
+
+def find_zigzag_points(data, order=5):
+    """
+    إيجاد نقاط الزقزاق باستخدام القمم والقيعان المحلية
+    order = عدد الشموع للمقارنة من كل جانب
+    """
+    if data is None or len(data) < order * 3:
+        return None
+
+    highs = data['High'].values
+    lows = data['Low'].values
+    closes = data['Close'].values
+
+    # إيجاد القمم والقيعان
+    local_max_idx = argrelextrema(highs, np.greater_equal, order=order)[0]
+    local_min_idx = argrelextrema(lows, np.less_equal, order=order)[0]
+
+    if len(local_max_idx) < 2 or len(local_min_idx) < 2:
+        return None
+
+    # دمج القمم والقيعان وترتيبها
+    pivot_points = []
+    for idx in local_max_idx:
+        pivot_points.append({
+            'index': idx,
+            'price': highs[idx],
+            'type': 'high',
+            'date': data.iloc[idx]['Date'] if 'Date' in data.columns else data.index[idx]
+        })
+    for idx in local_min_idx:
+        pivot_points.append({
+            'index': idx,
+            'price': lows[idx],
+            'type': 'low',
+            'date': data.iloc[idx]['Date'] if 'Date' in data.columns else data.index[idx]
+        })
+
+    pivot_points.sort(key=lambda x: x['index'])
+
+    # تنظيف: إزالة النقاط المتتالية من نفس النوع (الاحتفاظ بالأعلى/الأدنى)
+    cleaned = []
+    i = 0
+    while i < len(pivot_points):
+        j = i
+        same_type = [pivot_points[i]]
+        while j + 1 < len(pivot_points) and pivot_points[j + 1]['type'] == pivot_points[i]['type']:
+            j += 1
+            same_type.append(pivot_points[j])
+        if pivot_points[i]['type'] == 'high':
+            best = max(same_type, key=lambda x: x['price'])
+        else:
+            best = min(same_type, key=lambda x: x['price'])
+        cleaned.append(best)
+        i = j + 1
+
+    return cleaned
+
+
+def find_wolfe_wave_bullish(zigzag_points, data, tolerance=0.02):
+    """
+    البحث عن موجة ولف ويف صاعدة (Bullish)
+
+    القواعد:
+    - النقطة 0 (قمة): أكبر من النقطة 1 (قاع)
+    - النقطة 2 (قمة): أعلى من النقطة 1 وأقل من النقطة 0
+    - النقطة 3 (قاع): أقل من النقطتين 1 و 2
+    - النقطة 4 (قمة): بين النقطة 3 والنقطة 2
+    - النقطة 5 (قاع): أقل من النقطة 3
+
+    الترتيب: قمة(0) -> قاع(1) -> قمة(2) -> قاع(3) -> قمة(4) -> قاع(5)
+    """
+    if zigzag_points is None or len(zigzag_points) < 6:
+        return None
+
+    waves_found = []
+
+    # البحث عن تسلسل: high, low, high, low, high, low
+    for i in range(len(zigzag_points) - 5):
+        pts = zigzag_points[i:i + 6]
+
+        # التحقق من التسلسل: high, low, high, low, high, low
+        expected_types = ['high', 'low', 'high', 'low', 'high', 'low']
+        types_match = all(pts[k]['type'] == expected_types[k] for k in range(6))
+
+        if not types_match:
+            continue
+
+        p0 = pts[0]  # قمة 0
+        p1 = pts[1]  # قاع 1
+        p2 = pts[2]  # قمة 2
+        p3 = pts[3]  # قاع 3
+        p4 = pts[4]  # قمة 4
+        p5 = pts[5]  # قاع 5
+
+        # القاعدة 1: النقطة 0 (قمة) أكبر من النقطة 1 (قاع)
+        if not (p0['price'] > p1['price']):
+            continue
+
+        # القاعدة 2: النقطة 2 (قمة) أعلى من النقطة 1 (قاع) وأقل من النقطة 0 (قمة)
+        if not (p2['price'] > p1['price'] and p2['price'] < p0['price']):
+            continue
+
+        # القاعدة 3: النقطة 3 (قاع) أقل من النقطتين 1 و 2
+        if not (p3['price'] < p1['price'] and p3['price'] < p2['price']):
+            continue
+
+        # القاعدة 4: النقطة 4 (قمة) بين النقطة 3 والنقطة 2
+        if not (p4['price'] > p3['price'] and p4['price'] < p2['price']):
+            continue
+
+        # القاعدة 5: النقطة 5 (قاع) أقل من النقطة 3
+        if not (p5['price'] < p3['price']):
+            continue
+
+        # تم العثور على موجة ولف ويف صاعدة!
+        wave = {
+            'points': [p0, p1, p2, p3, p4, p5],
+            'wave_0': p0,
+            'wave_1': p1,
+            'wave_2': p2,
+            'wave_3': p3,
+            'wave_4': p4,
+            'wave_5': p5,
+        }
+
+        # حساب خط الهدف (من النقطة 1 إلى النقطة 4)
+        idx1 = p1['index']
+        idx4 = p4['index']
+        price1 = p1['price']
+        price4 = p4['price']
+
+        if idx4 != idx1:
+            slope = (price4 - price1) / (idx4 - idx1)
+        else:
+            slope = 0
+
+        wave['target_slope'] = slope
+        wave['target_intercept'] = price1 - slope * idx1
+
+        # حساب السعر المستهدف عند امتداد خط 1-4
+        # نمد الخط حتى نقطة بعد النقطة 5
+        future_idx = p5['index'] + (idx4 - idx1)
+        target_price = slope * future_idx + wave['target_intercept']
+        wave['target_price'] = target_price
+        wave['target_future_idx'] = future_idx
+
+        waves_found.append(wave)
+
+    # إرجاع آخر موجة تم العثور عليها (الأحدث)
+    if waves_found:
+        return waves_found[-1]
+    return None
+
+
+def calculate_target_line(wave, data_length, extend=50):
+    """حساب خط الهدف (1-4) وامتداده"""
+    p1 = wave['wave_1']
+    p4 = wave['wave_4']
+
+    idx1 = p1['index']
+    idx4 = p4['index']
+    price1 = p1['price']
+    price4 = p4['price']
+
+    slope = wave['target_slope']
+    intercept = wave['target_intercept']
+
+    # نقاط الخط من النقطة 1 إلى ما بعد النقطة 5
+    line_indices = list(range(idx1, min(data_length + extend, data_length + extend)))
+    line_prices = [slope * idx + intercept for idx in line_indices]
+
+    return line_indices, line_prices
+
+
+def plot_wolfe_wave(data, wave, symbol, stock_name, interval_label):
+    """رسم موجة الولف ويف مع الزقزاق والأهداف"""
+
+    fig = go.Figure()
+
+    # رسم الشموع اليابانية
+    date_col = 'Date' if 'Date' in data.columns else data.index
+    dates = data['Date'] if 'Date' in data.columns else data.index
+
+    fig.add_trace(go.Candlestick(
+        x=list(range(len(data))),
+        open=data['Open'],
+        high=data['High'],
+        low=data['Low'],
+        close=data['Close'],
+        name='السعر',
+        increasing_line_color='#26a69a',
+        decreasing_line_color='#ef5350',
+        opacity=0.7
+    ))
+
+    # رسم خطوط الزقزاق بين نقاط الموجة
+    points = wave['points']
+    zz_x = [p['index'] for p in points]
+    zz_y = [p['price'] for p in points]
+
+    fig.add_trace(go.Scatter(
+        x=zz_x,
+        y=zz_y,
+        mode='lines+markers+text',
+        name='زقزاق الولف ويف',
+        line=dict(color='#FFD700', width=3, dash='solid'),
+        marker=dict(size=14, color='#FFD700', symbol='diamond',
+                    line=dict(width=2, color='white')),
+        text=[f'W{i}<br>{p["price"]:.2f}' for i, p in enumerate(points)],
+        textposition='top center',
+        textfont=dict(size=12, color='white', family='Arial Black')
+    ))
+
+    # رسم خط الهدف (1-4) وامتداده
+    p1 = wave['wave_1']
+    p4 = wave['wave_4']
+    p5 = wave['wave_5']
+
+    # خط من النقطة 1 إلى النقطة 4 وامتداده
+    slope = wave['target_slope']
+    intercept = wave['target_intercept']
+
+    # امتداد الخط لمسافة كافية بعد النقطة 5
+    extend_length = max(30, int((p5['index'] - p1['index']) * 1.5))
+    target_end_idx = p5['index'] + extend_length
+
+    target_x = [p1['index'], p4['index'], target_end_idx]
+    target_y = [p1['price'], p4['price'], slope * target_end_idx + intercept]
+
+    fig.add_trace(go.Scatter(
+        x=target_x,
+        y=target_y,
+        mode='lines',
+        name='خط الهدف (1→4)',
+        line=dict(color='#00E5FF', width=2.5, dash='dash'),
+    ))
+
+    # إضافة تسمية خط الهدف
+    target_price_at_end = slope * target_end_idx + intercept
+    fig.add_annotation(
+        x=target_end_idx,
+        y=target_price_at_end,
+        text=f"هدف: {target_price_at_end:.2f}",
+        showarrow=True,
+        arrowhead=2,
+        arrowcolor='#00E5FF',
+        font=dict(size=13, color='#00E5FF', family='Arial Black'),
+        bgcolor='rgba(0,0,0,0.7)',
+        bordercolor='#00E5FF',
+        borderwidth=1
+    )
+
+    # رسم خط أفقي من النقطة 5 وامتداده لليمين
+    p5_price = p5['price']
+    horizontal_end_idx = target_end_idx
+
+    fig.add_trace(go.Scatter(
+        x=[p5['index'], horizontal_end_idx],
+        y=[p5_price, p5_price],
+        mode='lines',
+        name=f'مستوى النقطة 5 ({p5_price:.2f})',
+        line=dict(color='#FF6D00', width=2, dash='dot'),
+    ))
+
+    # إضافة تسمية للخط الأفقي
+    fig.add_annotation(
+        x=horizontal_end_idx,
+        y=p5_price,
+        text=f"دخول: {p5_price:.2f}",
+        showarrow=False,
+        font=dict(size=12, color='#FF6D00', family='Arial Black'),
+        bgcolor='rgba(0,0,0,0.7)',
+        bordercolor='#FF6D00',
+        borderwidth=1,
+        xanchor='left'
+    )
+
+    # رسم خط 0-3 (اختياري للتوضيح)
+    fig.add_trace(go.Scatter(
+        x=[points[0]['index'], points[3]['index']],
+        y=[points[0]['price'], points[3]['price']],
+        mode='lines',
+        name='خط 0→3',
+        line=dict(color='rgba(255,255,255,0.3)', width=1, dash='dot'),
+        showlegend=False
+    ))
+
+    # تلوين النقاط بألوان مختلفة
+    colors = ['#FF5252', '#4CAF50', '#FF5252', '#4CAF50', '#FF5252', '#4CAF50']
+    labels = ['W0 (قمة)', 'W1 (قاع)', 'W2 (قمة)', 'W3 (قاع)', 'W4 (قمة)', 'W5 (قاع/دخول)']
+
+    for i, (p, color, label) in enumerate(zip(points, colors, labels)):
+        fig.add_trace(go.Scatter(
+            x=[p['index']],
+            y=[p['price']],
+            mode='markers',
+            name=label,
+            marker=dict(size=18, color=color, symbol='star',
+                        line=dict(width=2, color='white')),
+            showlegend=True
+        ))
+
+    # منطقة الربح المتوقع
+    fig.add_shape(
+        type="rect",
+        x0=p5['index'],
+        x1=target_end_idx,
+        y0=p5_price,
+        y1=target_price_at_end,
+        fillcolor="rgba(76, 175, 80, 0.1)",
+        line=dict(color="rgba(76, 175, 80, 0.3)", width=1),
+    )
+
+    # إعدادات الرسم البياني
+    fig.update_layout(
+        title=dict(
+            text=f'🐺 موجة الولف ويف الصاعدة - {stock_name} ({symbol}) - {interval_label}',
+            font=dict(size=20, color='white'),
+            x=0.5
+        ),
+        template='plotly_dark',
+        xaxis_title='الشموع',
+        yaxis_title='السعر',
+        height=700,
+        showlegend=True,
+        legend=dict(
+            bgcolor='rgba(0,0,0,0.5)',
+            bordercolor='white',
+            borderwidth=1,
+            font=dict(size=11)
+        ),
+        xaxis=dict(
+            rangeslider=dict(visible=False),
+            gridcolor='rgba(255,255,255,0.1)'
+        ),
+        yaxis=dict(
+            gridcolor='rgba(255,255,255,0.1)'
+        ),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(26,26,46,1)',
+    )
+
+    return fig
+
+
+def scan_stock(symbol, stock_name, interval, period, zigzag_order):
+    """فحص سهم واحد"""
+    data = download_data(symbol, period, interval)
+    if data is None or len(data) < 30:
+        return None, None, None
+
+    zigzag = find_zigzag_points(data, order=zigzag_order)
+    if zigzag is None:
+        return data, None, zigzag
+
+    wave = find_wolfe_wave_bullish(zigzag, data)
+    return data, wave, zigzag
+
+
+# ============================================================
+# الشريط الجانبي
+# ============================================================
+st.sidebar.markdown("## ⚙️ إعدادات الماسح")
+
+# اختيار الفاصل الزمني
+interval_option = st.sidebar.selectbox(
+    "📊 الفاصل الزمني",
+    ["يومي", "أسبوعي", "يومي + أسبوعي"],
+    index=0
+)
+
+interval_map = {
+    "يومي": [("1d", "يومي")],
+    "أسبوعي": [("1wk", "أسبوعي")],
+    "يومي + أسبوعي": [("1d", "يومي"), ("1wk", "أسبوعي")]
+}
+
+intervals = interval_map[interval_option]
+
+# فترة البيانات
+period = st.sidebar.selectbox(
+    "📅 فترة البيانات",
+    ["6mo", "1y", "2y", "5y"],
+    index=1,
+    format_func=lambda x: {
+        "6mo": "6 أشهر",
+        "1y": "سنة",
+        "2y": "سنتين",
+        "5y": "5 سنوات"
+    }[x]
+)
+
+# حساسية الزقزاق
+zigzag_order = st.sidebar.slider(
+    "🔀 حساسية الزقزاق (order)",
+    min_value=3,
+    max_value=15,
+    value=5,
+    step=1,
+    help="عدد الشموع للمقارنة لتحديد القمم والقيعان. قيمة أكبر = نقاط أقل وأكثر أهمية"
+)
+
+# اختيار الأسهم
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 📋 الأسهم المراد فحصها")
+
+selected_stocks = st.sidebar.multiselect(
+    "اختر الأسهم",
+    options=list(SAUDI_STOCKS.keys()),
+    default=list(SAUDI_STOCKS.keys()),
+    format_func=lambda x: f"{SAUDI_STOCKS[x]} ({x.replace('.SR', '')})"
+)
+
+# ============================================================
+# زر الفحص
+# ============================================================
+st.sidebar.markdown("---")
+scan_button = st.sidebar.button("🔍 ابدأ الفحص", type="primary", use_container_width=True)
+
+# ============================================================
+# المنطقة الرئيسية
+# ============================================================
+
+# شرح الموجة
+with st.expander("📖 شرح موجة الولف ويف الصاعدة (Bullish Wolfe Wave)", expanded=False):
+    st.markdown("""
+    ### 🐺 قواعد موجة الولف ويف الصاعدة:
+
+    | النقطة | النوع | القاعدة |
+    |--------|-------|---------|
+    | **W0** | قمة ↑ | نقطة البداية (أعلى قمة) |
+    | **W1** | قاع ↓ | أقل من النقطة 0 |
+    | **W2** | قمة ↑ | أعلى من النقطة 1 وأقل من النقطة 0 |
+    | **W3** | قاع ↓ | أقل من النقطتين 1 و 2 |
+    | **W4** | قمة ↑ | بين النقطة 3 والنقطة 2 |
+    | **W5** | قاع ↓ | أقل من النقطة 3 (نقطة الدخول) |
+
+    ### 🎯 الهدف:
+    - **خط الهدف**: يمتد من النقطة 1 إلى النقطة 4 ويُمد للأمام
+    - **نقطة الدخول**: عند النقطة 5
+    - **الهدف**: حيث يلتقي السعر مع امتداد خط 1→4
+
+    ### 📊 الخطوط على الرسم:
+    - 🟡 **خط الزقزاق**: يوصل بين نقاط الموجة
+    - 🔵 **خط الهدف (1→4)**: خط متقطع أزرق
+    - 🟠 **خط الدخول (W5)**: خط أفقي من النقطة 5
+    """)
+
+if scan_button:
+    if not selected_stocks:
+        st.error("❌ الرجاء اختيار سهم واحد على الأقل!")
+    else:
+        st.markdown("---")
+        st.markdown("## 📊 نتائج الفحص")
+
+        results_found = []
+        total_scans = len(selected_stocks) * len(intervals)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        scan_count = 0
+
+        for interval_code, interval_label in intervals:
+            st.markdown(f"### ⏱️ الفاصل: {interval_label}")
+
+            for symbol in selected_stocks:
+                stock_name = SAUDI_STOCKS[symbol]
+                scan_count += 1
+                progress_bar.progress(scan_count / total_scans)
+                status_text.text(f"جاري فحص: {stock_name} ({symbol}) - {interval_label}...")
+
+                data, wave, zigzag = scan_stock(
+                    symbol, stock_name, interval_code, period, zigzag_order
+                )
+
+                if data is None:
+                    st.warning(f"⚠️ لم يتم تحميل بيانات {stock_name}")
+                    continue
+
+                if wave is not None:
+                    results_found.append({
+                        'symbol': symbol,
+                        'name': stock_name,
+                        'interval': interval_label,
+                        'wave': wave,
+                        'data': data
+                    })
+
+                    # عرض النتيجة
+                    col1, col2 = st.columns([3, 1])
+
+                    with col2:
+                        st.markdown(f"""
+                        ### ✅ {stock_name}
+                        **الرمز:** {symbol.replace('.SR', '')}
+                        **الفاصل:** {interval_label}
+
+                        ---
+                        **نقاط الموجة:**
+                        - 🔴 W0: **{wave['wave_0']['price']:.2f}**
+                        - 🟢 W1: **{wave['wave_1']['price']:.2f}**
+                        - 🔴 W2: **{wave['wave_2']['price']:.2f}**
+                        - 🟢 W3: **{wave['wave_3']['price']:.2f}**
+                        - 🔴 W4: **{wave['wave_4']['price']:.2f}**
+                        - 🟢 W5: **{wave['wave_5']['price']:.2f}** ← دخول
+
+                        ---
+                        **🎯 السعر المستهدف:**
+                        ### {wave['target_price']:.2f}
+
+                        **📈 نسبة الربح المتوقعة:**
+                        ### {((wave['target_price'] - wave['wave_5']['price']) / wave['wave_5']['price'] * 100):.1f}%
+                        """)
+
+                    with col1:
+                        fig = plot_wolfe_wave(
+                            data, wave, symbol, stock_name, interval_label
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("---")
+                else:
+                    st.info(f"ℹ️ {stock_name} ({symbol}) - لم يتم العثور على موجة ولف ويف صاعدة على الفاصل {interval_label}")
+
+        progress_bar.progress(1.0)
+        status_text.text("✅ اكتمل الفحص!")
+
+        # ملخص النتائج
+        st.markdown("---")
+        st.markdown("## 📋 ملخص النتائج")
+
+        if results_found:
+            st.success(f"✅ تم العثور على {len(results_found)} موجة ولف ويف صاعدة!")
+
+            summary_data = []
+            for r in results_found:
+                w = r['wave']
+                entry = w['wave_5']['price']
+                target = w['target_price']
+                profit_pct = (target - entry) / entry * 100
+
+                summary_data.append({
+                    'السهم': r['name'],
+                    'الرمز': r['symbol'].replace('.SR', ''),
+                    'الفاصل': r['interval'],
+                    'سعر الدخول (W5)': f"{entry:.2f}",
+                    'الهدف': f"{target:.2f}",
+                    'نسبة الربح %': f"{profit_pct:.1f}%",
+                    'W0': f"{w['wave_0']['price']:.2f}",
+                    'W1': f"{w['wave_1']['price']:.2f}",
+                    'W2': f"{w['wave_2']['price']:.2f}",
+                    'W3': f"{w['wave_3']['price']:.2f}",
+                    'W4': f"{w['wave_4']['price']:.2f}",
+                    'W5': f"{w['wave_5']['price']:.2f}",
+                })
+
+            df_summary = pd.DataFrame(summary_data)
+            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+
+            # فحص الأسهم المنطبقة على الفاصلين
+            if interval_option == "يومي + أسبوعي":
+                st.markdown("### 🌟 الأسهم المنطبقة على الفاصلين (يومي + أسبوعي)")
+                daily_symbols = set(
+                    r['symbol'] for r in results_found if r['interval'] == 'يومي'
+                )
+                weekly_symbols = set(
+                    r['symbol'] for r in results_found if r['interval'] == 'أسبوعي'
+                )
+                both = daily_symbols & weekly_symbols
+
+                if both:
+                    for sym in both:
+                        name = SAUDI_STOCKS[sym]
+                        st.success(f"⭐ **{name}** ({sym.replace('.SR', '')}) - موجة ولف ويف على الفاصلين اليومي والأسبوعي!")
+                else:
+                    st.info("لم يتم العثور على أسهم منطبقة على الفاصلين معاً")
+        else:
+            st.warning("❌ لم يتم العثور على أي موجة ولف ويف صاعدة في الأسهم المحددة")
+            st.info("💡 **نصائح:**\n"
+                    "- جرب تغيير حساسية الزقزاق\n"
+                    "- جرب فترة بيانات أطول\n"
+                    "- جرب فاصل زمني مختلف")
+
+else:
+    # رسالة ترحيبية
+    st.markdown("""
+    <div style="text-align: center; padding: 50px;">
+        <h2>👈 اضغط على زر "ابدأ الفحص" في الشريط الجانبي</h2>
+        <p style="color: #888; font-size: 1.2rem;">
+            اختر الأسهم والفاصل الزمني ثم ابدأ البحث عن موجات الولف ويف الصاعدة
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # عرض صورة توضيحية
+    st.markdown("""
+    ### 📐 شكل موجة الولف ويف الصاعدة:
+    ```
+         W0
+        /  \\
+       /    \\      W2
+      /      \\    / \\       W4
+     /        \\  /   \\     / \\
+    /          W1     \\   /   \\
+                       W3     \\
+                               W5  ← نقطة الدخول
+                                \\
+                                 → الهدف (امتداد خط 1-4)
+    ```
+
+    **التسلسل:** W0(قمة) → W1(قاع) → W2(قمة) → W3(قاع) → W4(قمة) → W5(قاع)
+    """)
+
+# ============================================================
+# تذييل
+# ============================================================
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #666; padding: 20px;">
+    <p>🐺 ماسح موجة الولف ويف - السوق السعودي</p>
+    <p style="font-size: 0.8rem;">
+        ⚠️ هذه الأداة للأغراض التعليمية فقط وليست نصيحة استثمارية.
+        يرجى إجراء التحليل الخاص بك قبل اتخاذ أي قرار استثماري.
+    </p>
+</div>
+""", unsafe_allow_html=True)
